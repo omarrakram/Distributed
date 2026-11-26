@@ -1,0 +1,17 @@
+[project]
+name = "dtq"
+version = "1.0.0"
+description = "Distributed Task Queue with fault tolerance and dynamic worker scaling (custom broker)"
+requires-python = ">=3.11"
+readme = "../README.md"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+timeout = 300
+markers = [
+    "system: multi-process tests (broker/workers/agent/autoscaler as separate OS processes)",
+    "e2e: tests against a running docker compose stack (set DTQ_E2E_API)",
+]
+filterwarnings = ["ignore::DeprecationWarning"]
