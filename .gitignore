@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.venv/
+venv/
+# Node / frontend
+node_modules/
+frontend/dist/
+frontend/test-results/
+frontend/playwright-report/
+# Environment & secrets
+.env
+*.local
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+# Runtime artifacts
+*.log
+benchmarks/results/raw/*.tmp
+TEAM_HANDOVER/
+*.tsbuildinfo

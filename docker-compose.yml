@@ -1,0 +1,159 @@
+# Distributed Task Queue — complete single-host deployment.
+#   docker compose up --build        (dashboard: http://localhost:8080, API docs: http://localhost:8000/docs)
+# Worker containers are created at runtime by the `agent` service (3 initially; autoscaled 3..8).
+# Copy .env.example to .env to change tokens, ports or timing parameters.
+name: dtq
+
+x-backend: &backend
+  image: dtq-backend:latest
+  pull_policy: never          # built locally once (by the `migrate` service below), never pulled
+  restart: unless-stopped
+  networks: [dtq-net]
+  environment: &common-env
+    DTQ_LOG_LEVEL: ${DTQ_LOG_LEVEL:-INFO}
+    DTQ_LOG_FORMAT: ${DTQ_LOG_FORMAT:-json}
+    DTQ_DATABASE_URL: postgresql://${POSTGRES_USER:-dtq}:${POSTGRES_PASSWORD:-dtq}@postgres:5432/${POSTGRES_DB:-dtq}
+    DTQ_CLUSTER_TOKEN: ${DTQ_CLUSTER_TOKEN:-dev-cluster-token}
+    DTQ_AGENT_TOKEN: ${DTQ_AGENT_TOKEN:-dev-agent-token}
+    DTQ_ADMIN_TOKEN: ${DTQ_ADMIN_TOKEN:-dev-admin-token}
+    DTQ_DEMO_MODE: ${DTQ_DEMO_MODE:-true}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-dtq}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dtq}
+      POSTGRES_DB: ${POSTGRES_DB:-dtq}
+    volumes:
+      - dtq-pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:${DTQ_PG_PORT:-5433}:5432"   # debugging/analysis only; workers never use it
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-dtq} -d ${POSTGRES_DB:-dtq}"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks: [dtq-net]
+
+  migrate:
+    <<: *backend
+    build:
+      context: ./backend    # the single build of dtq-backend:latest, shared by every backend service and worker
+    command: ["python", "-m", "dtq", "migrate"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  broker:
+    <<: *backend
+    command: ["python", "-m", "dtq", "broker"]
+    environment:
+      <<: *common-env
+      DTQ_PORT: "8001"
+      DTQ_HEARTBEAT_INTERVAL_S: ${DTQ_HEARTBEAT_INTERVAL_S:-2}
+      DTQ_WORKER_SUSPECT_AFTER_S: ${DTQ_WORKER_SUSPECT_AFTER_S:-6}
+      DTQ_WORKER_DEAD_AFTER_S: ${DTQ_WORKER_DEAD_AFTER_S:-10}
+      DTQ_LEASE_DURATION_S: ${DTQ_LEASE_DURATION_S:-15}
+      DTQ_ASSIGN_ACK_TIMEOUT_S: ${DTQ_ASSIGN_ACK_TIMEOUT_S:-10}
+      DTQ_RETRY_BACKOFF_BASE_S: ${DTQ_RETRY_BACKOFF_BASE_S:-1}
+      DTQ_RETRY_BACKOFF_MAX_S: ${DTQ_RETRY_BACKOFF_MAX_S:-30}
+    ports:
+      - "${DTQ_BROKER_PORT:-8001}:8001"         # published so workers on other machines can join
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-m", "dtq", "healthcheck", "broker"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    <<: *backend
+    command: ["python", "-m", "dtq", "api"]
+    environment:
+      <<: *common-env
+      DTQ_PORT: "8000"
+      DTQ_BROKER_URL: http://broker:8001
+      DTQ_AGENT_URLS: ${DTQ_AGENT_URLS:-http://agent:8003}
+    ports:
+      - "${DTQ_API_PORT:-8000}:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-m", "dtq", "healthcheck", "api"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  agent:
+    <<: *backend
+    command: ["python", "-m", "dtq", "agent"]
+    user: "0:0"                                 # needs the Docker socket; nothing else does
+    environment:
+      <<: *common-env
+      DTQ_PORT: "8003"
+      DTQ_AGENT_ID: ${DTQ_AGENT_ID:-local}
+      DTQ_AGENT_BACKEND: docker
+      DTQ_AGENT_MAX_WORKERS: ${DTQ_AGENT_MAX_WORKERS:-12}
+      DTQ_WORKER_IMAGE: dtq-backend:latest
+      DTQ_DOCKER_NETWORK: dtq-net
+      DTQ_WORKER_BROKER_URL: http://broker:8001
+      DTQ_WORKER_DEFAULT_CAPACITY: ${DTQ_WORKER_CAPACITY:-2}
+      DTQ_WORKER_CPUS: ${DTQ_WORKER_CPUS:-0}
+      DTQ_WORKER_MEMORY_MB: ${DTQ_WORKER_MEMORY_MB:-768}
+      DTQ_WORKER_GRACEFUL_TIMEOUT_S: ${DTQ_WORKER_GRACEFUL_TIMEOUT_S:-30}
+      DTQ_COMPOSE_PROJECT: dtq
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    stop_grace_period: 40s
+    depends_on:
+      broker:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-m", "dtq", "healthcheck", "agent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  autoscaler:
+    <<: *backend
+    command: ["python", "-m", "dtq", "autoscaler"]
+    environment:
+      <<: *common-env
+      DTQ_BROKER_URL: http://broker:8001
+      DTQ_AGENT_URLS: ${DTQ_AGENT_URLS:-http://agent:8003}
+      DTQ_INITIAL_WORKERS: ${DTQ_INITIAL_WORKERS:-3}
+    depends_on:
+      agent:
+        condition: service_healthy
+      broker:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-m", "dtq", "healthcheck", "autoscaler"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  frontend:
+    image: dtq-frontend:latest
+    build:
+      context: ./frontend
+    restart: unless-stopped
+    ports:
+      - "${DTQ_HTTP_PORT:-8080}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    networks: [dtq-net]
+
+networks:
+  dtq-net:
+    name: dtq-net
+
+volumes:
+  dtq-pgdata:
